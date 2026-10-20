@@ -1,0 +1,17 @@
+KeyMacro  by 霭阳霁月 (ayjy)
+
+如果 install.bat 自动下载 MSYS2 失败，
+可以用浏览器手动下载后放在本文件夹：
+
+1. 浏览器打开：
+   https://mirrors.tuna.tsinghua.edu.cn/msys2/distrib/x86_64/
+
+2. 下载最新的那个文件，名字类似：
+   msys2-x86_64-20260611.exe   （约 81 MB）
+
+3. 把下载好的 .exe 直接放进本文件夹（installers\）
+
+4. 重新双击 install.bat
+   脚本会自动识别并使用它，不再联网下载
+
+浏览器下载通常比命令行稳定，也支持迅雷等工具。
