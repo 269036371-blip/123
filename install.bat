@@ -41,53 +41,23 @@ echo       using: !KEYS!
 echo.
 
 rem ---------- [3/5] obtain exe ----------
-echo  [3/5] getting KeyMacro.exe...
+echo  [3/5] preparing KeyMacro.exe...
 set "EXE="
 
+rem The prebuilt binary is bundled in bin\. No download, no compiler,
+rem no network access - this works on any Windows 10/11 PC out of the box.
 if exist "!BIN!" (
     set "EXE=!BIN!"
     echo       bundled binary found - no download, no compile needed
 )
 
 if not defined EXE (
-    set "GXX="
-    for %%P in (
-        "C:\msys64\ucrt64\bin\g++.exe"
-        "C:\msys64\mingw64\bin\g++.exe"
-        "C:\msys32\mingw32\bin\g++.exe"
-        "C:\mingw64\bin\g++.exe"
-        "C:\mingw32\bin\g++.exe"
-    ) do (
-        if not defined GXX if exist "%%~P" set "GXX=%%~P"
-    )
-    if not defined GXX (
-        where g++ >nul 2>&1
-        if !errorlevel! equ 0 set "GXX=g++"
-    )
-    if defined GXX (
-        echo       compiling with: !GXX!
-        "!GXX!" -std=c++17 -O2 -municode -mwindows "!SRC!" -o "!OUT!" -luser32 -lwinmm -lshell32 -static
-        if exist "!OUT!" (
-            set "EXE=!OUT!"
-            echo       compiled OK
-        ) else (
-            echo       [X] compile failed
-        )
-    )
-)
-
-if not defined EXE (
     echo.
-    echo       [X] no bundled binary and no C++ compiler on this PC.
+    echo       [X] bundled binary is missing:
+    echo         !BIN!
     echo.
-    echo       Easiest fix - download MSYS2 from a China mirror:
-    echo         https://mirrors.tuna.tsinghua.edu.cn/msys2/distrib/x86_64/
-    echo         https://mirrors.ustc.edu.cn/msys2/distrib/x86_64/
-    echo         https://mirrors.aliyun.com/msys2/distrib/x86_64/
-    echo.
-    echo       Download msys2-x86_64-XXXXXXXX.exe, put it into:
-    echo         !ROOT!installers
-    echo       then run this installer again.
+    echo       The package is incomplete. Please re-extract ALL files
+    echo       from KeyMacro-ayjy.zip (keep the bin\ folder) and try again.
     echo.
     pause
     exit /b 1

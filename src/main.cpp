@@ -28,7 +28,9 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
+#endif
 
 #include <windows.h>
 #include <shellapi.h>
@@ -79,20 +81,44 @@ static BYTE g_activeVk[kMaxKeys] = {
 };
 static int  g_activeCount = kWlCount;
 
-// 看门狗阈值：物理键自动重复约 30Hz，正常时时间戳不会停这么久
-static constexpr uint64_t kPhysTimeoutUs = 800ULL * 1000;
+// 看门狗阈值：物理键自动重复约 30Hz，正常按住时时间戳会持续刷新。
+// 放宽到 3 秒是为了容忍"系统按键重复被关闭"或远程桌面等低刷新场景
+// —— 这类场景下时间戳本就不会自动刷新，阈值太短会误清正在连发的键。
+// 已知边界：若用户彻底关闭了键盘自动重复，长时间按住仍可能触发一次
+// 误清。权衡后选择"宁可迟一点清，也不要打断正常连发"。
+static constexpr uint64_t kPhysTimeoutUs = 3000ULL * 1000;
 
 // ============================================================
 // 全局状态
 // ============================================================
 struct KeyState {
-    BYTE  vk   = 0;
-    BYTE  scan = 0;
-    bool  extended = false;
+    // 这三个字段由主线程（reload 换键位 / 钩子 down 分支）写、
+    // 调度线程（SendKeyDown/SendKeyUp）读，必须是 atomic，否则是数据竞争。
+    std::atomic<BYTE> vk{0};
+    std::atomic<BYTE> scan{0};
+    std::atomic<bool> extended{false};
     std::atomic<bool>     physicalDown{false};  // 物理键是否按住
     std::atomic<bool>     isDown{false};        // 我方已发 DOWN 未配 UP
     std::atomic<uint64_t> nextDownUs{0};
     std::atomic<uint64_t> nextUpUs{0};
+
+    // down/up 配对标记：记录"这个键的 down 当初是否被我们吞掉"。
+    // 之所以单独设一个字段而不是复用 physicalDown，是因为 F8 禁用时
+    // 会清 physicalDown 来停止连发，若配对信息也存在那里，禁用后再松手
+    // 就会误判为"没吞过 down"而透传 up，系统侧收到孤立 up。
+    // 只有真正的物理 up 事件才清它 —— ReleaseAllKeys / InitKeys 绝不碰：
+    // reload 时用户可能仍按着键，若此时清掉标记，稍后到达的物理 up 会被
+    // 误判成"没吞过 down"而透传，系统侧收到孤立 up。
+    std::atomic<bool>     swallowedDown{false};
+
+    // 偏差诊断（P2 修复：改为每键独立统计）
+    // 旧版用函数内 static 变量，多键同按时所有键的样本混在一起算，
+    // 诊断数字会被相互干扰而失去参考价值。
+    // 这些字段只由调度线程访问，不需要 atomic。
+    uint64_t statLast = 0;
+    uint64_t statCnt  = 0;
+    uint64_t statSum  = 0;
+    uint64_t statMax  = 0;
 };
 
 static KeyState          g_keys[kMaxKeys];
@@ -174,10 +200,14 @@ static void SendKeyEvt(BYTE vk, BYTE scan, bool extended, bool up) {
 }
 
 static void SendKeyDown(const KeyState& ks) {
-    SendKeyEvt(ks.vk, ks.scan, ks.extended, false);
+    SendKeyEvt(ks.vk.load(std::memory_order_acquire),
+               ks.scan.load(std::memory_order_acquire),
+               ks.extended.load(std::memory_order_acquire), false);
 }
 static void SendKeyUp(const KeyState& ks) {
-    SendKeyEvt(ks.vk, ks.scan, ks.extended, true);
+    SendKeyEvt(ks.vk.load(std::memory_order_acquire),
+               ks.scan.load(std::memory_order_acquire),
+               ks.extended.load(std::memory_order_acquire), true);
 }
 
 // ============================================================
@@ -279,26 +309,33 @@ static void ProcessDueKeys(uint64_t now) {
             && d > 0 && d <= now) {
             SendKeyDown(ks);
             ks.isDown.store(true, std::memory_order_release);
-            ks.nextUpUs.store(now + pressUs,       std::memory_order_release);
-            ks.nextDownUs.store(now + intervalUs,  std::memory_order_release);
+            ks.nextUpUs.store(now + pressUs, std::memory_order_release);
 
-            // ---- 偏差统计（P0-3）----
-            static uint64_t s_last = 0, s_cnt = 0, s_sum = 0, s_max = 0;
-            if (s_last) {
-                int64_t diff = (int64_t)now - (int64_t)(s_last + intervalUs);
+            // P2 修复：基于"计划时刻 d"递推，而不是基于实际发送时刻 now。
+            // 用 now 递推会把每一轮的调度延迟累积进去，长时间连发后
+            // 实际间隔会持续大于设定值（漂移）。
+            uint64_t nextD = d + intervalUs;
+            // 掉队过多时重置基准而不是追赶补发，否则会瞬间爆发一串按键
+            if (nextD <= now) nextD = now + intervalUs;
+            ks.nextDownUs.store(nextD, std::memory_order_release);
+
+            // ---- 偏差统计（每键独立）----
+            if (ks.statLast) {
+                int64_t diff = (int64_t)now - (int64_t)(ks.statLast + intervalUs);
                 if (diff < 0) diff = -diff;
-                s_sum += (uint64_t)diff;
-                if ((uint64_t)diff > s_max) s_max = (uint64_t)diff;
-                if (++s_cnt % 100 == 0) {
-                    TraceF("[KeyMacro] 偏差 avg=%lluus max=%lluus | 间隔 %dms 保持 %dms | 高精度定时器=%d\n",
-                           (unsigned long long)(s_sum / s_cnt),
-                           (unsigned long long)s_max,
+                ks.statSum += (uint64_t)diff;
+                if ((uint64_t)diff > ks.statMax) ks.statMax = (uint64_t)diff;
+                if (++ks.statCnt % 100 == 0) {
+                    TraceF("[KeyMacro] vk=0x%02X 偏差 avg=%lluus max=%lluus | 间隔 %dms 保持 %dms | 高精度定时器=%d\n",
+                           (unsigned)ks.vk.load(std::memory_order_relaxed),
+                           (unsigned long long)(ks.statSum / ks.statCnt),
+                           (unsigned long long)ks.statMax,
                            (int)g_intervalMs.load(std::memory_order_relaxed),
                            (int)g_pressMs.load(std::memory_order_relaxed),
                            (int)g_hiResTimerOk.load(std::memory_order_relaxed));
                 }
             }
-            s_last = now;
+            ks.statLast = now;
         }
     }
 }
@@ -313,7 +350,15 @@ static void CheckWatchdog() {
     if (last == 0) return;
     if (now - last <= kPhysTimeoutUs) return;
 
-    // 钩子大概率已被系统卸载 → 才真正清状态
+    // 没有任何键处于按下状态时，超时是无害的（用户只是长时间没按键），
+    // 不必打扰，也不必重置时间戳。
+    bool anyDown = false;
+    for (const auto& ks : g_keys) {
+        if (ks.physicalDown.load(std::memory_order_acquire)) { anyDown = true; break; }
+    }
+    if (!anyDown) return;
+
+    // 钩子大概率已被系统卸载（收不到 up 了）→ 才真正清状态
     TraceA("[KeyMacro] 看门狗触发：物理事件超时，清空所有通道\n");
     for (auto& ks : g_keys)
         ks.physicalDown.store(false, std::memory_order_release);
@@ -329,6 +374,10 @@ static void ReleaseAllKeys() {
         ks.physicalDown.store(false, std::memory_order_release);
         ks.nextDownUs.store(0, std::memory_order_release);
         ks.nextUpUs.store(0, std::memory_order_release);
+        // 注意：这里绝不能清 swallowedDown。
+        // 它是 down/up 配对标记，若在此清掉而用户仍按着键，稍后到达的
+        // 物理 up 会被误判为"没吞过 down"而透传，系统侧收到孤立 up。
+        // 配对标记只由真正的物理 up 事件清。
     }
 }
 
@@ -336,7 +385,9 @@ static void ReleaseAllKeys() {
 // 调度线程
 // ============================================================
 static DWORD WINAPI SchedulerThread(LPVOID) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    // P1 修复：不再用 THREAD_PRIORITY_TIME_CRITICAL(15)。
+    // 5ms 连发不需要 31 级实时优先级，在核心数少的机器上会饿死其它线程。
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     // 先做最基础的：提升系统时钟分辨率（大概率无效，但零成本）
     timeBeginPeriod(1);
@@ -471,17 +522,40 @@ static LRESULT CALLBACK LowLevelKeyboardProc(
 
     // ---- Ctrl+Alt+F12 退出（P0-2：latch）----
     if (kb->vkCode == VK_F12) {
-        if (isUp) { g_f12Down = false; return 1; }
-        if (g_f12Down) return 1;
-        g_f12Down = true;
-        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
-            (GetAsyncKeyState(VK_MENU)    & 0x8000) &&
-            !((GetAsyncKeyState(VK_LWIN)  & 0x8000) ||
-              (GetAsyncKeyState(VK_RWIN)  & 0x8000))) {
-            PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
-            return 1;
+        // P0-A 更干净写法：非 Ctrl+Alt 的普通 F12 完全不管，
+        // down/up 一律透传，连 latch 都不设。
+        //
+        // 上一版虽然做到了 down/up 配对，但仍对普通 F12 设了 latch，
+        // 导致按住普通 F12 时系统自动重复的后续 down 被 latch 吞掉
+        // —— 应用只收到一次 down，F12 的原生自动重复行为被改变。
+        // 现在只有组合键成立时才介入，其余场景 F12 与没装本程序一致。
+        // up 必须先处理，且无条件清 latch —— 用清之前的值决定这次 up
+        // 是吞还是透传。
+        // 不能像 down 那样先判 ctrlAlt：组合键 down 触发退出后，用户很可能
+        // 先松 Ctrl/Alt 再松 F12，此时 up 到达时 ctrlAlt=false，若走透传
+        // 分支就会漏掉清 latch。残留的 true 会让下一次组合键的 down 被
+        // if (g_f12Down) return 1 吞掉却不触发退出 —— 第一次按键白按。
+        if (isUp) {
+            const bool wasSwallowed = g_f12Down;
+            g_f12Down = false;
+            return wasSwallowed ? 1
+                   : CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
-        return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+        const bool ctrlAlt =
+            ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) &&
+            ((GetAsyncKeyState(VK_MENU)    & 0x8000) != 0) &&
+            ((GetAsyncKeyState(VK_LWIN)    & 0x8000) == 0) &&
+            ((GetAsyncKeyState(VK_RWIN)    & 0x8000) == 0);
+
+        if (!ctrlAlt)   // 普通 F12 down：完全透传，不设 latch
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+        // 组合键成立：down 吞掉（其 up 由上面的分支配对吞掉）
+        if (g_f12Down) return 1;      // 自动重复
+        g_f12Down = true;
+        PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
+        return 1;
     }
 
     const int idx = WlIndex(kb->vkCode);
@@ -491,20 +565,49 @@ static LRESULT CALLBACK LowLevelKeyboardProc(
     if (!g_enabled.load(std::memory_order_acquire))
         return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
+    KeyState& ks = g_keys[idx];
+
+    // ---- P0-B 修复：抬起必须无条件清理 physicalDown ----
+    // 旧代码把修饰键透传分支放在 isUp 处理之前，于是
+    //   「按住 1 → 按下 Ctrl → 松开 1」
+    // 松手时 ModifierHeld() 为真 → 直接透传返回 → physicalDown 永远
+    // 清不掉 → 连发一直持续到看门狗超时才停（约 1 秒），
+    // 用户体感就是"松手后还连发一秒"。
+    //
+    // 透传与否要看当初那个 down 是不是被我们吞掉的：
+    //   吞过 down → up 也吞，保证 down/up 配对，系统侧完全不知道此键被按过
+    //   没吞过 down（修饰键场景下透传了）→ up 也透传，避免系统收到孤立 up
+    //
+    // 配对信息取自 swallowedDown 而非 physicalDown：F8 禁用连发时会清
+    // physicalDown 来停止连发，若复用它做配对标记，禁用后再松手就会
+    // 误判成"没吞过 down"而透传，系统侧收到孤立 up。
+    if (isUp) {
+        // 无条件停连发：哪怕配对标记显示不是我们吞的，也必须停止
+        ks.physicalDown.store(false, std::memory_order_release);
+        const bool wasOurs =
+            ks.swallowedDown.exchange(false, std::memory_order_acq_rel);
+        if (wasOurs) {
+            SetEvent(g_stateEvent);
+            return 1;
+        }
+        return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+
     // 修饰键组合一律透传（Ctrl+1 之类不该连发）
     if (ModifierHeld() || (kb->flags & LLKHF_ALTDOWN))
         return CallNextHookEx(nullptr, nCode, wParam, lParam);
-
-    KeyState& ks = g_keys[idx];
 
     if (isDown) {
         // 系统自动重复：physicalDown 已为 true → 忽略
         if (ks.physicalDown.exchange(true, std::memory_order_acq_rel))
             return 1;
+        // 记下"这次 down 被我们吞了"，供后续 up 配对使用
+        ks.swallowedDown.store(true, std::memory_order_release);
 
         // 首发：钩子内直发，与物理 keydown 同一时刻到达
-        ks.scan     = (BYTE)(kb->scanCode & 0xFF);
-        ks.extended = (kb->flags & LLKHF_EXTENDED) != 0;
+        ks.scan.store((BYTE)(kb->scanCode & 0xFF), std::memory_order_release);
+        ks.extended.store((kb->flags & LLKHF_EXTENDED) != 0,
+                          std::memory_order_release);
 
         SendKeyDown(ks);
 
@@ -516,12 +619,6 @@ static LRESULT CALLBACK LowLevelKeyboardProc(
         ks.nextDownUs.store(now + intervalUs, std::memory_order_release);
         SetEvent(g_stateEvent);
         return 1;          // 吞掉原始按下，避免双触发
-    }
-
-    if (isUp) {
-        ks.physicalDown.store(false, std::memory_order_release);
-        SetEvent(g_stateEvent);
-        return 1;          // 吞掉原始抬起
     }
 
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -571,9 +668,11 @@ static BYTE VkFromToken(const std::wstring& raw) {
         { L"ALT", VK_MENU },          { L"LALT", VK_LMENU },
         { L"RALT", VK_RMENU },        { L"WIN", VK_LWIN },
         { L"LWIN", VK_LWIN },         { L"RWIN", VK_RWIN },
-        { L"LMB", VK_LBUTTON },       { L"RMB", VK_RBUTTON },
-        { L"MMB", VK_MBUTTON },       { L"X1", VK_XBUTTON1 },
-        { L"X2", VK_XBUTTON2 }
+        { L"PAUSE", VK_PAUSE },       { L"SCROLL", VK_SCROLL },
+        { L"NUMLOCK", VK_NUMLOCK },   { L"PRINTSCREEN", VK_SNAPSHOT }
+        // 注：鼠标键（LMB/RMB/MMB/X1/X2）已从支持列表移除 ——
+        // 本程序用 INPUT_KEYBOARD 发送，且低级键盘钩子收不到鼠标事件，
+        // 列出来会让人误以为可以配置。
     };
     for (const auto& e : kNamed)
         if (s == e.n) return e.vk;
@@ -627,13 +726,13 @@ static void LoadConfig() {
     if (!f) {
         f = _wfopen(path.c_str(), L"wb");
         if (f) {
-            int nb = WideCharToMultiByte(CP_UTF8, 0, kTemplate, -1,
-                                         nullptr, 0, nullptr, nullptr);
-            std::string out((size_t)(nb > 0 ? nb : 1), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, kTemplate, -1,
-                                &out[0], nb, nullptr, nullptr);
-            fwrite("\xEF\xBB\xBF", 1, 3, f);
-            fwrite(out.c_str(), 1, out.size() - 1, f);
+            // P2 修复：写 UTF-16LE 而不是 UTF-8。
+            // GetPrivateProfileStringW 只识别 ANSI 或 UTF-16LE；写 UTF-8
+            // 会让中文注释按当前代码页解释成乱码，用户若在文件里加中文
+            // section 名 / 键名更是直接读不出来。
+            const wchar_t bom = 0xFEFF;
+            fwrite(&bom, sizeof(bom), 1, f);
+            fwrite(kTemplate, 1, wcslen(kTemplate) * sizeof(wchar_t), f);
             fclose(f);
         }
         return;
@@ -669,8 +768,21 @@ static void LoadConfig() {
             g_activeCount = n;
             TraceF("[KeyMacro] 载入键位：%d 个（来自配置）\n", n);
         } else {
-            TraceF("[KeyMacro] 键位配置无法识别，沿用默认 %d 个\n", kWlCount);
+            // 一个都解析不出来：重置为默认，而不是保留上次的值
+            for (int i = 0; i < kWlCount; ++i)
+                g_activeVk[i] = kWhitelistVk[i];
+            g_activeCount = kWlCount;
+            TraceF("[KeyMacro] 键位配置无法识别，已重置为默认 %d 个\n",
+                   kWlCount);
         }
+    } else {
+        // list 整段删掉或留空 = 使用默认键位。
+        // 必须与模板里"整段删掉或留空 = 使用默认键位"的说明一致：
+        // 旧代码在这里直接跳过，保留了上次的键位，用户清空后 reload
+        // 会发现键位没变，与文档不符。
+        for (int i = 0; i < kWlCount; ++i)
+            g_activeVk[i] = kWhitelistVk[i];
+        g_activeCount = kWlCount;
     }
 
     const int interval = GetPrivateProfileIntW(L"timing", L"interval_ms",
@@ -679,9 +791,12 @@ static void LoadConfig() {
                                                kDefaultPressMs, path.c_str());
 
     int iv = interval, ps = press;
-    if (iv < 1 || iv > 500) iv = kDefaultIntervalMs;
+    // P2 修复：旧写法在 iv<=3 时会退化成 ps == iv（例如 iv=3,ps=3），
+    // press 与 interval 相等意味着"按下时长盖到下一次按下"，
+    // 游戏会看成一次长按而不是连发。这里先保证 iv 至少留出 3ms 空间。
+    if (iv < 4 || iv > 500) iv = kDefaultIntervalMs;
     if (ps < 3 || ps > 50)  ps = kDefaultPressMs;
-    if (ps >= iv)           ps = iv - 1 >= 3 ? iv - 1 : 3;
+    if (ps >= iv)           ps = iv - 1;
 
     g_intervalMs.store(iv, std::memory_order_release);
     g_pressMs.store(ps, std::memory_order_release);
@@ -717,6 +832,32 @@ static void TrayRefresh() {
 }
 
 static void TrayRemove() { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
+
+// 防重入：连点「关于」不会弹出多个对话框
+static std::atomic<bool> g_aboutOpen{false};
+
+static DWORD WINAPI AboutThread(LPVOID) {
+    MessageBoxW(nullptr,
+        L"KeyMacro —— Windows 后台键盘连发宏\n\n"
+        L"作者：霭阳霁月 (ayjy)\n\n"
+        L"F8             启用 / 禁用连发\n"
+        L"Ctrl+Alt+F12   退出程序\n\n"
+        L"托盘右键：打开配置文件 / 重新加载配置",
+        L"关于 KeyMacro", MB_ICONINFORMATION | MB_SETFOREGROUND);
+    g_aboutOpen.store(false, std::memory_order_release);
+    return 0;
+}
+
+static void ShowAboutAsync() {
+    if (g_aboutOpen.exchange(true, std::memory_order_acq_rel))
+        return;                       // 已在显示中
+    const HANDLE h = CreateThread(nullptr, 0, AboutThread, nullptr, 0, nullptr);
+    if (h) {
+        CloseHandle(h);
+    } else {
+        g_aboutOpen.store(false, std::memory_order_release);  // 建线程失败，解锁
+    }
+}
 
 static void ShowTrayMenu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
@@ -768,7 +909,13 @@ static LRESULT CALLBACK HiddenWndProc(
             return 0;
         }
         case IDM_RELOAD:
-            ReleaseAllKeys();   // 先补发释放，改键位时不会留下卡住的键
+            // P1 修复：先清空全部通道并唤醒调度线程，等它走出当前轮次，
+            // 再改写 g_keys[i].vk/scan/extended（这几个是非原子字段，
+            // 调度线程发送时会读）。清空后 ComputeNextWake() 必然返回
+            // "无任务"，调度线程不会再触碰它们；再等一拍确保已离开。
+            ReleaseAllKeys();
+            SetEvent(g_stateEvent);
+            Sleep(20);
             LoadConfig();
             InitKeys();
             TrayRefresh();
@@ -781,13 +928,11 @@ static LRESULT CALLBACK HiddenWndProc(
             return 0;
         }
         case IDM_ABOUT:
-            MessageBoxW(hwnd,
-                L"KeyMacro —— Windows 后台键盘连发宏\n\n"
-                L"作者：霭阳霁月 (ayjy)\n\n"
-                L"F8             启用 / 禁用连发\n"
-                L"Ctrl+Alt+F12   退出程序\n\n"
-                L"托盘右键：打开配置文件 / 重新加载配置",
-                L"关于 KeyMacro", MB_ICONINFORMATION);
+            // P1 修复：不在本线程弹模态对话框。
+            // 低级钩子回调就运行在消息泵线程上，模态 MessageBox 会阻塞
+            // 消息泵，超过系统超时（约 300ms）会被静默卸载钩子，
+            // 程序直接变哑且无任何提示。改由独立线程弹出。
+            ShowAboutAsync();
             return 0;
         case IDM_EXIT:
             PostQuitMessage(0);
@@ -829,16 +974,25 @@ static void InitKeys() {
         k.isDown.store(false,       std::memory_order_release);
         k.nextDownUs.store(0,       std::memory_order_release);
         k.nextUpUs.store(0,         std::memory_order_release);
-        k.vk       = 0;
-        k.scan     = 0;
-        k.extended = false;
+        // 不清 swallowedDown：reload 时用户可能仍按着键，清掉配对标记后
+        // 稍后到达的物理 up 会被误判为"没吞过 down"而透传，系统侧收到
+        // 孤立 up。多余槽位的残留无害 —— WlIndex 不会匹配到它们，
+        // 槽位被复用时新 down 会直接覆盖。
+        k.vk.store(0, std::memory_order_release);
+        k.scan.store(0, std::memory_order_release);
+        k.extended.store(false, std::memory_order_release);
+        k.statLast = 0;      // 重置偏差统计，换键位后旧样本不再混入
+        k.statCnt  = 0;
+        k.statSum  = 0;
+        k.statMax  = 0;
     }
     for (int i = 0; i < g_activeCount; ++i) {
         const BYTE vk = g_activeVk[i];
-        const UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-        g_keys[i].vk       = vk;
-        g_keys[i].scan     = (BYTE)(sc & 0xFF);
-        g_keys[i].extended = (sc & 0x100) != 0;
+        // P2 修复：用 MAPVK_VK_TO_VSC_EX，普通版本的高位不代表扩展键
+        const UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+        g_keys[i].vk.store(vk, std::memory_order_release);
+        g_keys[i].scan.store((BYTE)(sc & 0xFF), std::memory_order_release);
+        g_keys[i].extended.store((sc & 0x100) != 0, std::memory_order_release);
     }
 }
 
